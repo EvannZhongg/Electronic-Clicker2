@@ -8,7 +8,7 @@
 #include "nvs_flash.h"
 #include "esp_mac.h"
 #include "esp_timer.h" // 【修改点】 包含 esp_timer.h 用于获取时间戳
-
+#include "esp_rom_sys.h"
 // Button component
 #include "iot_button.h"
 
@@ -141,6 +141,7 @@ void init_display_gpio(void) {
 }
 
 // 数码管动态扫描任务
+// 数码管动态扫描任务
 void display_task(void *pvParameters) {
     int32_t count;
     uint8_t digit1, digit2, digit3;
@@ -174,73 +175,101 @@ void display_task(void *pvParameters) {
                 // 两位数或三位数负数（-10到-99），负号在DIG1
                 // --- 显示负号 (DIG1) ---
                 set_minus_sign();
-                gpio_set_level(DIG_1_PIN, 0); // 打开百位显示负号
-                vTaskDelay(pdMS_TO_TICKS(6));  // 6ms显示时间
-                gpio_set_level(DIG_1_PIN, 1); // 关闭
-                vTaskDelay(pdMS_TO_TICKS(1));  // 位切换间隔
+                gpio_set_level(DIG_1_PIN, 0); 
+                
+                // 【【【 优化: 减少延迟以提高刷新率 】】】
+                esp_rom_delay_us(2000);  // 2ms 显示时间
+                
+                gpio_set_level(DIG_1_PIN, 1); 
+                
+                // 【【【 优化 】】】
+                esp_rom_delay_us(500);  // 0.5ms 位切换间隔
 
                 // --- 显示十位 (DIG2) ---
                 set_segments(digit2);
-                gpio_set_level(DIG_2_PIN, 0); // 打开十位
-                vTaskDelay(pdMS_TO_TICKS(6));  // 6ms显示时间
-                gpio_set_level(DIG_2_PIN, 1); // 关闭十位
-                vTaskDelay(pdMS_TO_TICKS(1));  // 位切换间隔
+                gpio_set_level(DIG_2_PIN, 0); 
+                
+                // 【【【 优化 】】】
+                esp_rom_delay_us(2000);  
+                
+                gpio_set_level(DIG_2_PIN, 1); 
+                
+                // 【【【 优化 】】】
+                esp_rom_delay_us(500);  
 
                 // --- 显示个位 (DIG3) ---
                 set_segments(digit1);
-                gpio_set_level(DIG_3_PIN, 0); // 打开个位
-                vTaskDelay(pdMS_TO_TICKS(6));  // 6ms显示时间
-                gpio_set_level(DIG_3_PIN, 1); // 关闭个位
+                gpio_set_level(DIG_3_PIN, 0); 
+                
+                // 【【【 优化 】】】
+                esp_rom_delay_us(2000);  
+                
+                gpio_set_level(DIG_3_PIN, 1); 
             } else {
                 // 一位数负数（-1到-9），负号在DIG2
-                // --- 显示百位 (DIG1) ---（空白，不显示）
-                // 跳过DIG1，不显示任何内容
-
                 // --- 显示负号 (DIG2) ---
                 set_minus_sign();
-                gpio_set_level(DIG_2_PIN, 0); // 打开十位显示负号
-                vTaskDelay(pdMS_TO_TICKS(6));  // 6ms显示时间
-                gpio_set_level(DIG_2_PIN, 1); // 关闭
-                vTaskDelay(pdMS_TO_TICKS(1));  // 位切换间隔
+                gpio_set_level(DIG_2_PIN, 0); 
+                
+                // 【【【 优化 】】】
+                esp_rom_delay_us(2000);  
+                
+                gpio_set_level(DIG_2_PIN, 1); 
+                
+                // 【【【 优化 】】】
+                esp_rom_delay_us(500);  
 
                 // --- 显示个位 (DIG3) ---
                 set_segments(digit1);
-                gpio_set_level(DIG_3_PIN, 0); // 打开个位
-                vTaskDelay(pdMS_TO_TICKS(6));  // 6ms显示时间
-                gpio_set_level(DIG_3_PIN, 1); // 关闭个位
+                gpio_set_level(DIG_3_PIN, 0); 
+                
+                // 【【【 优化 】】】
+                esp_rom_delay_us(2000);  
+                
+                gpio_set_level(DIG_3_PIN, 1); 
             }
         } else {
             // 正数显示逻辑（0-999）
             // --- 显示百位 (DIG1) ---
             set_segments(digit3);
-            gpio_set_level(DIG_1_PIN, 0); // 打开百位
-            vTaskDelay(pdMS_TO_TICKS(6));  // 6ms显示时间
-            gpio_set_level(DIG_1_PIN, 1); // 关闭百位
-            vTaskDelay(pdMS_TO_TICKS(1));  // 位切换间隔
+            gpio_set_level(DIG_1_PIN, 0); 
+            
+            // 【【【 优化 】】】
+            esp_rom_delay_us(2000);  
+            
+            gpio_set_level(DIG_1_PIN, 1); 
+            
+            // 【【【 优化 】】】
+            esp_rom_delay_us(500);  
 
             // --- 显示十位 (DIG2) ---
             set_segments(digit2);
-            gpio_set_level(DIG_2_PIN, 0); // 打开十位
-            vTaskDelay(pdMS_TO_TICKS(6));  // 6ms显示时间
-            gpio_set_level(DIG_2_PIN, 1); // 关闭十位
-            vTaskDelay(pdMS_TO_TICKS(1));  // 位切换间隔
+            gpio_set_level(DIG_2_PIN, 0); 
+            
+            // 【【【 优化 】】】
+            esp_rom_delay_us(2000);  
+            
+            gpio_set_level(DIG_2_PIN, 1); 
+            
+            // 【【【 优化 】】】
+            esp_rom_delay_us(500);  
 
             // --- 显示个位 (DIG3) ---
             set_segments(digit1);
-            gpio_set_level(DIG_3_PIN, 0); // 打开个位
-            vTaskDelay(pdMS_TO_TICKS(6));  // 6ms显示时间
-            gpio_set_level(DIG_3_PIN, 1); // 关闭个位
+            gpio_set_level(DIG_3_PIN, 0); 
+            
+            // 【【【 优化 】】】
+            esp_rom_delay_us(2000);  
+            
+            gpio_set_level(DIG_3_PIN, 1); 
         }
         
-        // 【【【 关键修复 】】】
-        // 您的 vTaskDelay(pdMS_TO_TICKS(6)) 和 (1) 都会被编译为 0 Tick 延迟
-        // 因为您的系统 HZ 是 100，1 Tick = 10ms。
-        // 必须添加一个大于 0 Tick 的延迟来让出CPU，否则IDLE任务会"饿死"
-        vTaskDelay(1); // 至少让出1个 FreeRTOS Tick (即 10ms)
+        // 【 保留此延迟 】
+        // 必须保留 vTaskDelay(1) (即 10ms 睡眠) 
+        // 以便让出CPU给 IDLE 任务，防止看门狗 (WDT) 超时
+        vTaskDelay(1); 
     }
 }
-
-
 // *** 4. 按键处理 (使用 button 组件) ***
 
 // 键轴按键按下回调（单击事件）
