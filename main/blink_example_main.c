@@ -10,6 +10,11 @@
 #include "esp_timer.h"
 #include "esp_rom_sys.h"
 
+// 【关键头文件】用于底层硬件操作
+#include "esp_rom_gpio.h"       // GPIO 矩阵操作
+#include "soc/gpio_sig_map.h"   // 信号索引定义
+#include "driver/periph_ctrl.h" // 外设时钟控制
+
 // BLE (NimBLE) Includes
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
@@ -20,7 +25,7 @@
 
 static const char *TAG = "COUNTER_PROJECT";
 
-// *** 1. 引脚定义 (根据新硬件连接修改) ***
+// *** 1. 引脚定义 ***
 
 // 7段数码管段位 (A-G)
 #define SEG_A_PIN   GPIO_NUM_3
@@ -32,10 +37,10 @@ static const char *TAG = "COUNTER_PROJECT";
 #define SEG_G_PIN   GPIO_NUM_8
 
 // 3位共阳数码管位选 (DIG1-3)
-#define DIG_1_PIN   GPIO_NUM_10 // 百位
-// 【修改点】避开 USB 引脚 (18/19)，改用 20/21
-#define DIG_2_PIN   GPIO_NUM_20 // 十位 (UART RX)
-#define DIG_3_PIN   GPIO_NUM_21 // 个位 (UART TX)
+#define DIG_1_PIN   GPIO_NUM_10 
+// 使用 20/21 作为位选，必须处理掉 UART0 的默认连接
+#define DIG_2_PIN   GPIO_NUM_20 
+#define DIG_3_PIN   GPIO_NUM_21 
 
 // 输入引脚
 #define KEY_SWITCH_PIN  GPIO_NUM_0 // 键轴按键
@@ -45,35 +50,29 @@ static const char *TAG = "COUNTER_PROJECT";
 
 static volatile int32_t g_counter = 0;
 
-// 统计数据
 static volatile int32_t g_total_plus_counts = 0;
 static volatile int32_t g_total_minus_counts = 0;
 
-// 设备名称
 static char g_device_name[32] = "Counter-Init";
 
-// BLE 通知数据结构 (17字节)
 #pragma pack(push, 1)
 typedef struct {
-    int32_t current_total;  // 4 bytes: 当前总分
-    int8_t  event_type;     // 1 byte:  事件 (+1, -1, 0)
-    int32_t total_plus;     // 4 bytes: 累计加分
-    int32_t total_minus;    // 4 bytes: 累计减分
-    uint32_t timestamp_ms;  // 4 bytes: 时间戳
+    int32_t current_total;
+    int8_t  event_type;
+    int32_t total_plus;
+    int32_t total_minus;
+    uint32_t timestamp_ms;
 } counter_event_t;
 #pragma pack(pop)
 
 static volatile counter_event_t g_last_event;
 static volatile bool g_event_updated = false;
 
-// BLE 句柄
 static uint16_t g_ble_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 static uint16_t g_counter_val_handle;
 static uint8_t g_ble_addr_type;
 
-// 声明
 void start_ble_advertising(void);
-
 
 // *** 3. 数码管定时器扫描 ***
 
@@ -100,7 +99,6 @@ void set_segments_gpio(uint8_t mapping) {
     gpio_set_level(SEG_G_PIN, (mapping >> 6) & 1);
 }
 
-// 定时器回调：每 5ms 刷新一位
 void display_timer_callback(void* arg) {
     static int scan_index = 0; 
 
@@ -124,16 +122,16 @@ void display_timer_callback(void* arg) {
     bool show_blank = false; 
 
     switch (scan_index) {
-        case 0: // DIG 1
+        case 0: 
             if (is_neg && abs_val >= 10) show_minus = true; 
             else if (!is_neg) digit_val = (abs_val / 100) % 10;
             else show_blank = true; 
             break;
-        case 1: // DIG 2
+        case 1: 
             if (is_neg && abs_val < 10) show_minus = true; 
             else digit_val = (abs_val / 10) % 10;
             break;
-        case 2: // DIG 3
+        case 2: 
             digit_val = abs_val % 10;
             break;
     }
@@ -161,7 +159,8 @@ void display_timer_callback(void* arg) {
 }
 
 void init_display_gpio(void) {
-    // 复位引脚 (虽然 20/21 是 UART，复位一下更安全)
+    // 即使在 app_main 断开了矩阵，这里通过 gpio_config 再次确认引脚为输出模式
+    // 这会将 IO MUX 切换到 GPIO 功能
     gpio_reset_pin(DIG_2_PIN);
     gpio_reset_pin(DIG_3_PIN);
 
@@ -229,7 +228,6 @@ void button_poll_task(void *arg) {
     int zero_press_time = 0; bool zero_handled = false;
 
     while (1) {
-        // Key Switch
         int key_raw = gpio_get_level(KEY_SWITCH_PIN);
         if (key_raw != key_stable) {
             if (++key_cnt >= BTN_DEBOUNCE_TICKS) {
@@ -239,7 +237,6 @@ void button_poll_task(void *arg) {
             }
         } else key_cnt = 0;
 
-        // Zero Switch
         int zero_raw = gpio_get_level(ZERO_SWITCH_PIN);
         if (zero_raw != zero_stable) {
             if (++zero_cnt >= BTN_DEBOUNCE_TICKS) {
@@ -309,7 +306,14 @@ void ble_notify_event(void) {
     if (g_ble_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
         counter_event_t event_copy = g_last_event;
         struct os_mbuf *om = ble_hs_mbuf_from_flat(&event_copy, sizeof(event_copy));
-        if (om) ble_gatts_notify_custom(g_ble_conn_handle, g_counter_val_handle, om);
+        if (om) {
+            int rc = ble_gatts_notify_custom(g_ble_conn_handle, g_counter_val_handle, om);
+            // 【重要修复】如果发送失败，必须手动释放 mbuf，否则会造成内存泄漏
+            if (rc != 0) {
+                os_mbuf_free_chain(om);
+                ESP_LOGW(TAG, "Notify failed: %d", rc);
+            }
+        }
     }
 }
 
@@ -372,6 +376,24 @@ void ble_host_task(void *param) {
 
 void app_main(void)
 {
+    // ================================================================
+    // 【终极修复】物理切断 UART0 的所有输入源和时钟
+    // 这是一个“核选项”，确保无论之前的状态如何，UART0 都彻底死掉。
+    // ================================================================
+    
+    // 1. 强制关闭 UART0 外设时钟（切断电源）
+    periph_module_disable(PERIPH_UART0_MODULE);
+    
+    // 2. 修改 GPIO 交换矩阵：强行将 UART0 的 RX 输入信号连接到一个常量“1”（高电平）
+    // 这样，无论 GPIO 20 怎么翻转，UART0 内部只看到一条死一般平静的直线，永远不会触发中断。
+    esp_rom_gpio_connect_in_signal(GPIO_MATRIX_CONST_ONE_INPUT, U0RXD_IN_IDX, false);
+    
+    // 3. 物理复位引脚
+    gpio_reset_pin(GPIO_NUM_20);
+    gpio_reset_pin(GPIO_NUM_21);
+
+    // ================================================================
+
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -389,6 +411,7 @@ void app_main(void)
     esp_read_mac(mac, ESP_MAC_BT);
     snprintf(g_device_name, sizeof(g_device_name), "Counter-%02X%02X", mac[4], mac[5]);
     ble_svc_gap_device_name_set(g_device_name); 
+    
     ESP_LOGI(TAG, "BLE Name Set: %s", g_device_name);
     
     ble_svc_gap_init();
@@ -398,7 +421,6 @@ void app_main(void)
     ble_hs_cfg.sync_cb = ble_on_sync;
     nimble_port_freertos_init(ble_host_task);
     
-    // 此时 USB 依然可用，你可以看到所有启动日志
     vTaskDelay(pdMS_TO_TICKS(500));
 
     esp_timer_handle_t display_timer;
