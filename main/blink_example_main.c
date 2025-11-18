@@ -7,10 +7,8 @@
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "esp_mac.h"
-#include "esp_timer.h" // 【修改点】 包含 esp_timer.h 用于获取时间戳
+#include "esp_timer.h"
 #include "esp_rom_sys.h"
-// Button component
-#include "iot_button.h"
 
 // BLE (NimBLE) Includes
 #include "nimble/nimble_port.h"
@@ -22,7 +20,7 @@
 
 static const char *TAG = "COUNTER_PROJECT";
 
-// *** 1. 引脚定义 (根据你的方案) ***
+// *** 1. 引脚定义 (根据新硬件连接修改) ***
 
 // 7段数码管段位 (A-G)
 #define SEG_A_PIN   GPIO_NUM_3
@@ -35,74 +33,64 @@ static const char *TAG = "COUNTER_PROJECT";
 
 // 3位共阳数码管位选 (DIG1-3)
 #define DIG_1_PIN   GPIO_NUM_10 // 百位
-#define DIG_2_PIN   GPIO_NUM_19 // 十位
-#define DIG_3_PIN   GPIO_NUM_18 // 个位
+// 【修改点】避开 USB 引脚 (18/19)，改用 20/21
+#define DIG_2_PIN   GPIO_NUM_20 // 十位 (UART RX)
+#define DIG_3_PIN   GPIO_NUM_21 // 个位 (UART TX)
 
 // 输入引脚
 #define KEY_SWITCH_PIN  GPIO_NUM_0 // 键轴按键
 #define ZERO_SWITCH_PIN GPIO_NUM_1 // 置零按键
 
-// 按键句柄
-static button_handle_t g_key_button_handle = NULL;
-static button_handle_t g_zero_button_handle = NULL;
+// *** 2. 全局变量与数据结构 ***
 
-// *** 2. 全局变量 ***
-
-// 计数器 (volatile 保证多任务安全访问，支持-99到999范围)
 static volatile int32_t g_counter = 0;
 
+// 统计数据
+static volatile int32_t g_total_plus_counts = 0;
+static volatile int32_t g_total_minus_counts = 0;
 
-// 【修改点】 BLE 通知的数据结构
-// 我们将发送一个结构体，而不是一个单独的int
-// 1字节对齐，确保在不同平台（ESP32/PC）上内存布局一致
+// 设备名称
+static char g_device_name[32] = "Counter-Init";
+
+// BLE 通知数据结构 (17字节)
 #pragma pack(push, 1)
 typedef struct {
-    int8_t event_type;      // 事件类型: 1 (加), -1 (减), 0 (清零)
-    uint32_t timestamp_ms;  // 事件发生时的时间戳 (毫秒)
-    int32_t current_total;  // 事件发生后的当前总数
+    int32_t current_total;  // 4 bytes: 当前总分
+    int8_t  event_type;     // 1 byte:  事件 (+1, -1, 0)
+    int32_t total_plus;     // 4 bytes: 累计加分
+    int32_t total_minus;    // 4 bytes: 累计减分
+    uint32_t timestamp_ms;  // 4 bytes: 时间戳
 } counter_event_t;
 #pragma pack(pop)
 
-// 用于BLE通知的事件数据
 static volatile counter_event_t g_last_event;
-// 计数器事件更新标志，通知BLE任务
 static volatile bool g_event_updated = false;
 
-
-// 用于BLE连接
+// BLE 句柄
 static uint16_t g_ble_conn_handle = BLE_HS_CONN_HANDLE_NONE;
-
-// BLE 句柄和地址类型变量
 static uint16_t g_counter_val_handle;
 static uint8_t g_ble_addr_type;
 
-// *** 声明函数原型 ***
+// 声明
 void start_ble_advertising(void);
 
 
-// *** 3. 数码管显示任务 ***
+// *** 3. 数码管定时器扫描 ***
 
-// 7段数码管编码 (0-9)
-// 编码格式：g,f,e,d,c,b,a (bit 6-0)，1=熄灭，0=点亮
 const uint8_t segment_map[10] = {
-    (1 << 6),                               // 0: a,b,c,d,e,f (熄灭g)
-    (1 << 0) | (1 << 3) | (1 << 4) | (1 << 5) | (1 << 6), // 1: b,c (熄灭a,d,e,f,g)
-    (1 << 2) | (1 << 5),                    // 2: a,b,d,e,g (熄灭c,f)
-    (1 << 4) | (1 << 5),                    // 3: a,b,c,d,g (熄灭e,f)
-    (1 << 0) | (1 << 3) | (1 << 4),         // 4: b,c,f,g (熄灭a,d,e)
-    (1 << 1) | (1 << 4),                    // 5: a,c,d,f,g (熄灭b,e)
-    (1 << 1),                               // 6: a,c,d,e,f,g (熄灭b)
-    (1 << 3) | (1 << 4) | (1 << 5) | (1 << 6), // 7: a,b,c (熄灭d,e,f,g)
-    0,                                      // 8: a,b,c,d,e,f,g (全部点亮)
-    (1 << 4)                                // 9: a,b,c,d,f,g (熄灭e，修复：a段应该点亮)
+    (1 << 6),                               // 0
+    (1 << 0) | (1 << 3) | (1 << 4) | (1 << 5) | (1 << 6), // 1
+    (1 << 2) | (1 << 5),                    // 2
+    (1 << 4) | (1 << 5),                    // 3
+    (1 << 0) | (1 << 3) | (1 << 4),         // 4
+    (1 << 1) | (1 << 4),                    // 5
+    (1 << 1),                               // 6
+    (1 << 3) | (1 << 4) | (1 << 5) | (1 << 6), // 7
+    0,                                      // 8
+    (1 << 4)                                // 9
 };
 
-// 根据数字设置7个段位引脚
-void set_segments(uint8_t num) {
-    if (num > 9) num = 0; // 仅显示0-9
-    uint8_t mapping = segment_map[num];
-
-    // 1 = 熄灭, 0 = 点亮
+void set_segments_gpio(uint8_t mapping) {
     gpio_set_level(SEG_A_PIN, (mapping >> 0) & 1);
     gpio_set_level(SEG_B_PIN, (mapping >> 1) & 1);
     gpio_set_level(SEG_C_PIN, (mapping >> 2) & 1);
@@ -112,21 +100,71 @@ void set_segments(uint8_t num) {
     gpio_set_level(SEG_G_PIN, (mapping >> 6) & 1);
 }
 
-// 显示负号（只点亮G段，其他段熄灭）
-void set_minus_sign(void) {
-    // 1 = 熄灭, 0 = 点亮
-    // 负号：只点亮G段（bit 6），其他段全部熄灭
-    gpio_set_level(SEG_A_PIN, 1);  // 熄灭
-    gpio_set_level(SEG_B_PIN, 1);  // 熄灭
-    gpio_set_level(SEG_C_PIN, 1);  // 熄灭
-    gpio_set_level(SEG_D_PIN, 1);  // 熄灭
-    gpio_set_level(SEG_E_PIN, 1);  // 熄灭
-    gpio_set_level(SEG_F_PIN, 1);  // 熄灭
-    gpio_set_level(SEG_G_PIN, 0);  // 点亮G段（负号）
+// 定时器回调：每 5ms 刷新一位
+void display_timer_callback(void* arg) {
+    static int scan_index = 0; 
+
+    // 消隐
+    gpio_set_level(DIG_1_PIN, 1);
+    gpio_set_level(DIG_2_PIN, 1);
+    gpio_set_level(DIG_3_PIN, 1);
+
+    int32_t count = g_counter;
+    uint32_t abs_val;
+    bool is_neg = false;
+    if (count < 0) {
+        is_neg = true;
+        abs_val = (uint32_t)(-count);
+    } else {
+        abs_val = (uint32_t)count;
+    }
+
+    uint8_t digit_val = 0;
+    bool show_minus = false; 
+    bool show_blank = false; 
+
+    switch (scan_index) {
+        case 0: // DIG 1
+            if (is_neg && abs_val >= 10) show_minus = true; 
+            else if (!is_neg) digit_val = (abs_val / 100) % 10;
+            else show_blank = true; 
+            break;
+        case 1: // DIG 2
+            if (is_neg && abs_val < 10) show_minus = true; 
+            else digit_val = (abs_val / 10) % 10;
+            break;
+        case 2: // DIG 3
+            digit_val = abs_val % 10;
+            break;
+    }
+
+    if (show_blank) {
+        set_segments_gpio(0xFF); 
+    } else if (show_minus) {
+        gpio_set_level(SEG_A_PIN, 1); gpio_set_level(SEG_B_PIN, 1);
+        gpio_set_level(SEG_C_PIN, 1); gpio_set_level(SEG_D_PIN, 1);
+        gpio_set_level(SEG_E_PIN, 1); gpio_set_level(SEG_F_PIN, 1);
+        gpio_set_level(SEG_G_PIN, 0);
+    } else {
+        if (digit_val > 9) digit_val = 0;
+        set_segments_gpio(segment_map[digit_val]);
+    }
+
+    if (!show_blank) {
+        if (scan_index == 0) gpio_set_level(DIG_1_PIN, 0);
+        else if (scan_index == 1) gpio_set_level(DIG_2_PIN, 0);
+        else if (scan_index == 2) gpio_set_level(DIG_3_PIN, 0);
+    }
+
+    scan_index++;
+    if (scan_index > 2) scan_index = 0;
 }
 
-// 初始化数码管所有GPIO
 void init_display_gpio(void) {
+    // 复位引脚 (虽然 20/21 是 UART，复位一下更安全)
+    gpio_reset_pin(DIG_2_PIN);
+    gpio_reset_pin(DIG_3_PIN);
+
     gpio_config_t io_conf = {
         .pin_bit_mask = (1ULL << SEG_A_PIN) | (1ULL << SEG_B_PIN) | (1ULL << SEG_C_PIN) |
                         (1ULL << SEG_D_PIN) | (1ULL << SEG_E_PIN) | (1ULL << SEG_F_PIN) |
@@ -140,249 +178,92 @@ void init_display_gpio(void) {
     gpio_config(&io_conf);
 }
 
-// 数码管动态扫描任务
-// 数码管动态扫描任务
-void display_task(void *pvParameters) {
-    int32_t count;
-    uint8_t digit1, digit2, digit3;
-    bool is_negative = false;
-    uint8_t abs_value;
+// *** 4. 按键处理 ***
 
-    // 初始关闭所有位选 (共阳，高电平关闭)
-    gpio_set_level(DIG_1_PIN, 1);
-    gpio_set_level(DIG_2_PIN, 1);
-    gpio_set_level(DIG_3_PIN, 1);
+void update_event(int8_t type) {
+    g_last_event.current_total = g_counter;
+    g_last_event.event_type = type;
+    g_last_event.total_plus = g_total_plus_counts;
+    g_last_event.total_minus = g_total_minus_counts;
+    g_last_event.timestamp_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    g_event_updated = true;
+}
+
+void handle_key_action(void) {
+    if (g_counter >= 999) g_counter = -99;
+    else g_counter++;
+    g_total_plus_counts++;
+    update_event(1);
+}
+
+void handle_zero_click(void) {
+    if (g_counter <= -99) g_counter = 999;
+    else g_counter--;
+    g_total_minus_counts++;
+    update_event(-1);
+}
+
+void handle_zero_long_press(void) {
+    g_counter = 0;
+    g_total_plus_counts = 0;  
+    g_total_minus_counts = 0; 
+    update_event(0); 
+    ESP_LOGI(TAG, "Counter Reset");
+}
+
+#define BTN_DEBOUNCE_TICKS  3
+#define LONG_PRESS_TICKS    500 
+
+void button_poll_task(void *arg) {
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << KEY_SWITCH_PIN) | (1ULL << ZERO_SWITCH_PIN),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    gpio_config(&io_conf);
+
+    int key_stable = 1; int key_cnt = 0;
+    int zero_stable = 1; int zero_cnt = 0;
+    int zero_press_time = 0; bool zero_handled = false;
 
     while (1) {
-        count = g_counter;
-        is_negative = (count < 0);
-        
-        // 获取绝对值用于显示
-        if (is_negative) {
-            abs_value = (uint8_t)(-count);  // 转换为正数
-        } else {
-            abs_value = (uint8_t)count;
-        }
+        // Key Switch
+        int key_raw = gpio_get_level(KEY_SWITCH_PIN);
+        if (key_raw != key_stable) {
+            if (++key_cnt >= BTN_DEBOUNCE_TICKS) {
+                key_stable = key_raw;
+                key_cnt = 0;
+                if (key_stable == 0) handle_key_action();
+            }
+        } else key_cnt = 0;
 
-        // 计算各位数字
-        digit1 = abs_value % 10;        // 个位
-        digit2 = (abs_value / 10) % 10;  // 十位
-        digit3 = (abs_value / 100) % 10; // 百位
-
-        if (is_negative) {
-            // 负数显示逻辑
-            if (abs_value >= 10) {
-                // 两位数或三位数负数（-10到-99），负号在DIG1
-                // --- 显示负号 (DIG1) ---
-                set_minus_sign();
-                gpio_set_level(DIG_1_PIN, 0); 
-                
-                // 【【【 优化: 减少延迟以提高刷新率 】】】
-                esp_rom_delay_us(2000);  // 2ms 显示时间
-                
-                gpio_set_level(DIG_1_PIN, 1); 
-                
-                // 【【【 优化 】】】
-                esp_rom_delay_us(500);  // 0.5ms 位切换间隔
-
-                // --- 显示十位 (DIG2) ---
-                set_segments(digit2);
-                gpio_set_level(DIG_2_PIN, 0); 
-                
-                // 【【【 优化 】】】
-                esp_rom_delay_us(2000);  
-                
-                gpio_set_level(DIG_2_PIN, 1); 
-                
-                // 【【【 优化 】】】
-                esp_rom_delay_us(500);  
-
-                // --- 显示个位 (DIG3) ---
-                set_segments(digit1);
-                gpio_set_level(DIG_3_PIN, 0); 
-                
-                // 【【【 优化 】】】
-                esp_rom_delay_us(2000);  
-                
-                gpio_set_level(DIG_3_PIN, 1); 
-            } else {
-                // 一位数负数（-1到-9），负号在DIG2
-                // --- 显示负号 (DIG2) ---
-                set_minus_sign();
-                gpio_set_level(DIG_2_PIN, 0); 
-                
-                // 【【【 优化 】】】
-                esp_rom_delay_us(2000);  
-                
-                gpio_set_level(DIG_2_PIN, 1); 
-                
-                // 【【【 优化 】】】
-                esp_rom_delay_us(500);  
-
-                // --- 显示个位 (DIG3) ---
-                set_segments(digit1);
-                gpio_set_level(DIG_3_PIN, 0); 
-                
-                // 【【【 优化 】】】
-                esp_rom_delay_us(2000);  
-                
-                gpio_set_level(DIG_3_PIN, 1); 
+        // Zero Switch
+        int zero_raw = gpio_get_level(ZERO_SWITCH_PIN);
+        if (zero_raw != zero_stable) {
+            if (++zero_cnt >= BTN_DEBOUNCE_TICKS) {
+                zero_stable = zero_raw;
+                zero_cnt = 0;
+                if (zero_stable == 0) { zero_press_time = 0; zero_handled = false; }
+                else if (!zero_handled) handle_zero_click();
             }
         } else {
-            // 正数显示逻辑（0-999）
-            // --- 显示百位 (DIG1) ---
-            set_segments(digit3);
-            gpio_set_level(DIG_1_PIN, 0); 
-            
-            // 【【【 优化 】】】
-            esp_rom_delay_us(2000);  
-            
-            gpio_set_level(DIG_1_PIN, 1); 
-            
-            // 【【【 优化 】】】
-            esp_rom_delay_us(500);  
-
-            // --- 显示十位 (DIG2) ---
-            set_segments(digit2);
-            gpio_set_level(DIG_2_PIN, 0); 
-            
-            // 【【【 优化 】】】
-            esp_rom_delay_us(2000);  
-            
-            gpio_set_level(DIG_2_PIN, 1); 
-            
-            // 【【【 优化 】】】
-            esp_rom_delay_us(500);  
-
-            // --- 显示个位 (DIG3) ---
-            set_segments(digit1);
-            gpio_set_level(DIG_3_PIN, 0); 
-            
-            // 【【【 优化 】】】
-            esp_rom_delay_us(2000);  
-            
-            gpio_set_level(DIG_3_PIN, 1); 
+            zero_cnt = 0;
+            if (zero_stable == 0) {
+                if (++zero_press_time >= LONG_PRESS_TICKS && !zero_handled) {
+                    handle_zero_long_press();
+                    zero_handled = true;
+                }
+            }
         }
-        
-        // 【 保留此延迟 】
-        // 必须保留 vTaskDelay(1) (即 10ms 睡眠) 
-        // 以便让出CPU给 IDLE 任务，防止看门狗 (WDT) 超时
-        vTaskDelay(1); 
-    }
-}
-// *** 4. 按键处理 (使用 button 组件) ***
-
-// 键轴按键按下回调（单击事件）
-static void key_button_single_click_cb(void *arg, void *usr_data) {
-    // 计数加一，限制范围到999
-    if (g_counter < 999) {
-        g_counter++;
-    }
-    
-    // 【修改点】 填充事件结构体
-    g_last_event.event_type = 1; // +1 事件
-    g_last_event.timestamp_ms = (uint32_t)(esp_timer_get_time() / 1000); // 毫秒时间戳
-    g_last_event.current_total = g_counter;
-    g_event_updated = true; // 设置事件更新标志
-    
-    ESP_LOGI(TAG, "按键按下! 计数: %ld", g_counter);
-}
-
-// 置零按键单击回调（轻触减一）
-static void zero_button_single_click_cb(void *arg, void *usr_data) {
-    // 计数减一，允许负数，限制范围到-99
-    if (g_counter > -99) {
-        g_counter--;
-    }
-
-    // 【修改点】 填充事件结构体
-    g_last_event.event_type = -1; // -1 事件
-    g_last_event.timestamp_ms = (uint32_t)(esp_timer_get_time() / 1000); // 毫秒时间戳
-    g_last_event.current_total = g_counter;
-    g_event_updated = true; // 设置事件更新标志
-
-    ESP_LOGI(TAG, "置零按键轻触，计数减一: %ld", g_counter);
-}
-
-// 置零按键长按回调（5秒长按清零）
-static void zero_button_long_press_cb(void *arg, void *usr_data) {
-    ESP_LOGI(TAG, "置零按键长按5秒，计数清零");
-    g_counter = 0;
-
-    // 【修改点】 填充事件结构体
-    g_last_event.event_type = 0; // 0 (清零) 事件
-    g_last_event.timestamp_ms = (uint32_t)(esp_timer_get_time() / 1000); // 毫秒时间戳
-    g_last_event.current_total = g_counter;
-    g_event_updated = true; // 设置事件更新标志
-}
-
-// 初始化按键（使用 button 组件）
-void init_inputs(void) {
-    esp_err_t ret;
-    
-    // 1. 初始化键轴按键 (GPIO0)
-    button_config_t key_button_config = {
-        .type = BUTTON_TYPE_GPIO,
-        .long_press_time = 0,  // 不需要长按功能
-        .short_press_time = 10,  // 短按时间10ms（用于防抖）
-        .gpio_button_config = {
-            .gpio_num = KEY_SWITCH_PIN,
-            .active_level = 0,  // 低电平有效（按下时为低电平）
-        },
-    };
-    
-    g_key_button_handle = iot_button_create(&key_button_config);
-    if (g_key_button_handle == NULL) {
-        ESP_LOGE(TAG, "Failed to create key button");
-        return;
-    }
-    
-    // 注册单击事件回调
-    ret = iot_button_register_cb(g_key_button_handle, BUTTON_SINGLE_CLICK, key_button_single_click_cb, NULL);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to register key button callback: %s", esp_err_to_name(ret));
-    } else {
-        ESP_LOGI(TAG, "Key button (GPIO%d) initialized successfully", KEY_SWITCH_PIN);
-    }
-    
-    // 2. 初始化置零按键 (GPIO1)
-    button_config_t zero_button_config = {
-        .type = BUTTON_TYPE_GPIO,
-        .long_press_time = 5000,  // 5秒长按
-        .short_press_time = 10,  // 短按时间10ms（用于防抖）
-        .gpio_button_config = {
-            .gpio_num = ZERO_SWITCH_PIN,
-            .active_level = 0,  // 低电平有效（按下时为低电平）
-        },
-    };
-    
-    g_zero_button_handle = iot_button_create(&zero_button_config);
-    if (g_zero_button_handle == NULL) {
-        ESP_LOGE(TAG, "Failed to create zero button");
-        return;
-    }
-    
-    // 注册单击事件回调（轻触减一）
-    ret = iot_button_register_cb(g_zero_button_handle, BUTTON_SINGLE_CLICK, zero_button_single_click_cb, NULL);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to register zero button single click callback: %s", esp_err_to_name(ret));
-    } else {
-        ESP_LOGI(TAG, "Zero button (GPIO%d) single click callback registered (decrement)", ZERO_SWITCH_PIN);
-    }
-    
-    // 注册长按事件回调（5秒长按清零）
-    ret = iot_button_register_cb(g_zero_button_handle, BUTTON_LONG_PRESS_START, zero_button_long_press_cb, NULL);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to register zero button long press callback: %s", esp_err_to_name(ret));
-    } else {
-        ESP_LOGI(TAG, "Zero button (GPIO%d) initialized successfully: single click=decrement, long press 5s=reset", ZERO_SWITCH_PIN);
+        vTaskDelay(pdMS_TO_TICKS(10)); 
     }
 }
 
 
-// *** 5. BLE (NimBLE) 通信 ***
+// *** 5. BLE (NimBLE) ***
 
-// 定义 UUID
 static const ble_uuid128_t gatt_svc_uuid =
     BLE_UUID128_INIT(0x28, 0x91, 0xae, 0x8d, 0x3d, 0x45, 0x4f, 0xde,
                      0x81, 0x4a, 0x51, 0x69, 0xd0, 0x18, 0x50, 0x01);
@@ -390,33 +271,23 @@ static const ble_uuid128_t gatt_chr_uuid =
     BLE_UUID128_INIT(0x28, 0x91, 0xae, 0x8d, 0x3d, 0x45, 0x4f, 0xde,
                      0x81, 0x4a, 0x51, 0x69, 0xd0, 0x18, 0x50, 0x02);
 
-// GATT 事件处理
 static int gatt_svc_access(uint16_t conn_handle, uint16_t attr_handle,
                            struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
-    // 【修改点】
-    // 当客户端 *读取* (READ) 特征时，我们只发送当前的 *总分* (int32_t)
-    // 当我们 *通知* (NOTIFY) 时，我们会发送完整的 *事件* (counter_event_t)
-    // 这种设计是允许的，并且很常用：读取=获取当前状态，通知=获取事件流
-
-    // 客户端读取计数值时调用
     if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
-        // 创建 g_counter 的本地副本以移除 volatile 限定符
-        int32_t count_copy = g_counter;
-        int rc = os_mbuf_append(ctxt->om, &count_copy, sizeof(count_copy));
+        counter_event_t evt;
+        evt.current_total = g_counter;
+        evt.event_type = 0;
+        evt.total_plus = g_total_plus_counts;
+        evt.total_minus = g_total_minus_counts;
+        evt.timestamp_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        
+        int rc = os_mbuf_append(ctxt->om, &evt, sizeof(evt));
         return (rc == 0) ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
     }
-    
-    // 客户端写入 CCCD (启用/禁用 Notify)
-    // 这个回调也会处理对CCCD的写入，这是启用通知所必需的，所以保留它
-    if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
-         ESP_LOGI(TAG, "客户端写入特性（可能是CCCD）");
-    }
-
     return 0;
 }
 
-// 定义GATT服务
 static const struct ble_gatt_svc_def gatt_svcs[] = {
     {
         .type = BLE_GATT_SVC_TYPE_PRIMARY,
@@ -425,41 +296,23 @@ static const struct ble_gatt_svc_def gatt_svcs[] = {
             {
                 .uuid = &gatt_chr_uuid.u,
                 .access_cb = gatt_svc_access,
-                // 保持 READ | NOTIFY
                 .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY,
                 .val_handle = &g_counter_val_handle,
             },
-            {0} // 结束
+            {0} 
         },
     },
-    {0} // 结束
+    {0} 
 };
 
-// 【修改点】 重命名并修改此函数以发送事件结构体
 void ble_notify_event(void) {
-    // 协议栈会自动检查谁订阅了通知。我们只需要检查连接句柄是否有效。
     if (g_ble_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
-        
-        // 创建 g_last_event 的本地副本以移除 volatile
         counter_event_t event_copy = g_last_event;
-        
-        // 从我们的事件结构体创建 mbuf
         struct os_mbuf *om = ble_hs_mbuf_from_flat(&event_copy, sizeof(event_copy));
-        
-        if (om) {
-            // NimBLE 会自动只发送给已订阅此特征的客户端
-            int rc = ble_gatts_notify_custom(g_ble_conn_handle, g_counter_val_handle, om);
-            if (rc == 0) {
-                 ESP_LOGI(TAG, "成功发送通知: type=%d, ts=%lu, total=%ld",
-                       event_copy.event_type, event_copy.timestamp_ms, event_copy.current_total);
-            } else {
-                 ESP_LOGE(TAG, "发送通知失败, rc=%d", rc);
-            }
-        }
+        if (om) ble_gatts_notify_custom(g_ble_conn_handle, g_counter_val_handle, om);
     }
 }
 
-// BLE GAP 事件处理
 static int ble_gap_event(struct ble_gap_event *event, void *arg)
 {
     switch (event->type) {
@@ -473,74 +326,70 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
         start_ble_advertising();
         break;
     case BLE_GAP_EVENT_ADV_COMPLETE:
-        ESP_LOGI(TAG, "BLE Advertising Complete");
-        start_ble_advertising(); // 广播可能超时，重启
+        start_ble_advertising(); 
         break;
     }
     return 0;
 }
 
-// 启动 BLE 广播
 void start_ble_advertising(void)
 {
     struct ble_gap_adv_params adv_params;
+    struct ble_hs_adv_fields fields;
+    const char *name;
+    int rc;
+
+    memset(&fields, 0, sizeof(fields));
+    fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
+
+    name = ble_svc_gap_device_name();
+    fields.name = (uint8_t *)name;
+    fields.name_len = strlen(name);
+    fields.name_is_complete = 1;
+
+    rc = ble_gap_adv_set_fields(&fields);
+    if (rc != 0) ESP_LOGE(TAG, "Adv fields error: %d", rc);
+
     memset(&adv_params, 0, sizeof(adv_params));
     adv_params.conn_mode = BLE_GAP_CONN_MODE_UND;
     adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
-
-    int rc = ble_gap_adv_start(BLE_OWN_ADDR_PUBLIC, NULL, BLE_HS_FOREVER, &adv_params, ble_gap_event, NULL);
-    if (rc == 0) {
-        ESP_LOGI(TAG, "BLE Advertising started");
-    } else {
-        ESP_LOGE(TAG, "Failed to start BLE advertising: %d", rc);
-    }
+    
+    rc = ble_gap_adv_start(BLE_OWN_ADDR_PUBLIC, NULL, BLE_HS_FOREVER, &adv_params, ble_gap_event, NULL);
+    if (rc != 0) ESP_LOGE(TAG, "Adv start error: %d", rc);
 }
 
-// BLE 协议栈同步回调
-void ble_on_sync(void)
-{
+void ble_on_sync(void) {
     ble_hs_id_infer_auto(0, &g_ble_addr_type); 
     start_ble_advertising();
 }
 
-// BLE 主任务
-void ble_host_task(void *param)
-{
-    nimble_port_run(); // 此函数不会返回
+void ble_host_task(void *param) {
+    nimble_port_run(); 
     nimble_port_freertos_deinit();
 }
 
-// *** 6. 主程序 (app_main) ***
+// *** 6. 主程序 ***
 
 void app_main(void)
 {
-    esp_err_t ret;
-
-    // 初始化 NVS (BLE 必需)
-    ret = nvs_flash_init();
+    esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
 
-    // 1. 初始化硬件
     init_display_gpio();
-    init_inputs();
+    
+    xTaskCreate(button_poll_task, "btn_poll", 4096, NULL, 1, NULL);
 
-    // 2. 启动数码管显示任务
-    xTaskCreate(display_task, "display_task", 2048, NULL, 1, NULL);
-
-    // 3. 初始化 BLE
     nimble_port_init();
     
-    // 获取MAC地址后4位作为设备标识，支持多设备识别
     uint8_t mac[6];
     esp_read_mac(mac, ESP_MAC_BT);
-    char device_name[32];
-    snprintf(device_name, sizeof(device_name), "Counter-%02X%02X", mac[4], mac[5]);
-    ble_svc_gap_device_name_set(device_name); // 设置BLE设备名称（使用MAC地址后4位）
-    ESP_LOGI(TAG, "BLE Device Name: %s", device_name);
+    snprintf(g_device_name, sizeof(g_device_name), "Counter-%02X%02X", mac[4], mac[5]);
+    ble_svc_gap_device_name_set(g_device_name); 
+    ESP_LOGI(TAG, "BLE Name Set: %s", g_device_name);
     
     ble_svc_gap_init();
     ble_svc_gatt_init();
@@ -548,20 +397,25 @@ void app_main(void)
     ble_gatts_add_svcs(gatt_svcs);
     ble_hs_cfg.sync_cb = ble_on_sync;
     nimble_port_freertos_init(ble_host_task);
+    
+    // 此时 USB 依然可用，你可以看到所有启动日志
+    vTaskDelay(pdMS_TO_TICKS(500));
 
-    ESP_LOGI(TAG, "ESP32 Counter Initialized");
-    ESP_LOGI(TAG, "Current counter value: %ld", g_counter);
+    esp_timer_handle_t display_timer;
+    esp_timer_create_args_t timer_args = {
+        .callback = &display_timer_callback,
+        .name = "display_timer"
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&timer_args, &display_timer));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(display_timer, 5000)); 
 
-    // 4. 主循环
+    ESP_LOGI(TAG, "System Running on new pins (20/21)");
+    
     while (1) {
-        
-        // 【修改点】 检查事件标志
         if (g_event_updated) {
-            ble_notify_event(); // 发送事件通知
+            ble_notify_event(); 
             g_event_updated = false;
         }
-
-        // 主循环延迟，让出CPU给其他任务
-        vTaskDelay(pdMS_TO_TICKS(50)); // 可以缩短轮询间隔以便更快地发送通知
+        vTaskDelay(pdMS_TO_TICKS(20)); 
     }
 }
