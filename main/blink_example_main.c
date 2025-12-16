@@ -28,19 +28,18 @@ static const char *TAG = "COUNTER_PROJECT";
 // *** 1. 引脚定义 ***
 
 // 7段数码管段位 (A-G)
-#define SEG_A_PIN   GPIO_NUM_3
-#define SEG_B_PIN   GPIO_NUM_7
-#define SEG_C_PIN   GPIO_NUM_6
-#define SEG_D_PIN   GPIO_NUM_4
-#define SEG_E_PIN   GPIO_NUM_2
-#define SEG_F_PIN   GPIO_NUM_5
+#define SEG_A_PIN   GPIO_NUM_4
+#define SEG_B_PIN   GPIO_NUM_2
+#define SEG_C_PIN   GPIO_NUM_7
+#define SEG_D_PIN   GPIO_NUM_6
+#define SEG_E_PIN   GPIO_NUM_5
+#define SEG_F_PIN   GPIO_NUM_3
 #define SEG_G_PIN   GPIO_NUM_8
 
-// 3位共阳数码管位选 (DIG1-3)
+
 #define DIG_1_PIN   GPIO_NUM_10 
-// 使用 20/21 作为位选，必须处理掉 UART0 的默认连接
-#define DIG_2_PIN   GPIO_NUM_20 
-#define DIG_3_PIN   GPIO_NUM_21 
+#define DIG_2_PIN   GPIO_NUM_20 // 注意：IO20 需要在 app_main 中禁用 UART0，你的代码已包含此逻辑
+#define DIG_3_PIN   GPIO_NUM_9
 
 // 输入引脚
 #define KEY_SWITCH_PIN  GPIO_NUM_0 // 键轴按键
@@ -211,7 +210,7 @@ void handle_zero_long_press(void) {
 }
 
 #define BTN_DEBOUNCE_TICKS  3
-#define LONG_PRESS_TICKS    500 
+#define LONG_PRESS_TICKS    300 
 
 void button_poll_task(void *arg) {
     gpio_config_t io_conf = {
@@ -268,13 +267,17 @@ static const ble_uuid128_t gatt_chr_uuid =
     BLE_UUID128_INIT(0x28, 0x91, 0xae, 0x8d, 0x3d, 0x45, 0x4f, 0xde,
                      0x81, 0x4a, 0x51, 0x69, 0xd0, 0x18, 0x50, 0x02);
 
+void handle_zero_long_press(void); 
+
 static int gatt_svc_access(uint16_t conn_handle, uint16_t attr_handle,
                            struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
+    // 1. 处理读取 (保持原样)
     if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
+        // ... (保持你原有的读取逻辑) ...
         counter_event_t evt;
         evt.current_total = g_counter;
-        evt.event_type = 0;
+        evt.event_type = 0; // Read 操作默认类型
         evt.total_plus = g_total_plus_counts;
         evt.total_minus = g_total_minus_counts;
         evt.timestamp_ms = (uint32_t)(esp_timer_get_time() / 1000);
@@ -282,7 +285,28 @@ static int gatt_svc_access(uint16_t conn_handle, uint16_t attr_handle,
         int rc = os_mbuf_append(ctxt->om, &evt, sizeof(evt));
         return (rc == 0) ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
     }
-    return 0;
+
+    // 2. 【新增】处理写入 (PC 发送重置指令)
+    if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
+        // 从 buffer 中读取数据
+        uint8_t data[1];
+        uint16_t len = OS_MBUF_PKTLEN(ctxt->om);
+        
+        if (len > 0) {
+            int rc = ble_hs_mbuf_to_flat(ctxt->om, data, sizeof(data), NULL);
+            if (rc != 0) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+
+            // 约定：如果收到 0x01，则执行重置
+            if (data[0] == 0x01) {
+                ESP_LOGI(TAG, "Received Reset Command from PC");
+                // 复用已有的长按清零逻辑，它会重置变量并调用 update_event(0)
+                handle_zero_long_press(); 
+            }
+        }
+        return 0;
+    }
+
+    return BLE_ATT_ERR_UNLIKELY;
 }
 
 static const struct ble_gatt_svc_def gatt_svcs[] = {
@@ -293,13 +317,14 @@ static const struct ble_gatt_svc_def gatt_svcs[] = {
             {
                 .uuid = &gatt_chr_uuid.u,
                 .access_cb = gatt_svc_access,
-                .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY,
+                // 【修改】增加 BLE_GATT_CHR_F_WRITE 权限
+                .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY | BLE_GATT_CHR_F_WRITE, 
                 .val_handle = &g_counter_val_handle,
             },
-            {0} 
+            {0}
         },
     },
-    {0} 
+    {0}
 };
 
 void ble_notify_event(void) {
